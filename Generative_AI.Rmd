@@ -1,0 +1,1123 @@
+---
+title: "final_project_c261"
+author: "Anirudh Divecha"
+date: "2025-11-26"
+output: pdf_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+
+```{r}
+# load libraries
+library(data.table)
+library(tidyverse)
+library(arrow)
+library(lightgbm)
+library(dplyr)
+library(data.table)
+library(readr)
+library(glmnet)
+library(Matrix)
+library(caret)
+library(pROC)
+```
+
+
+```{r}
+# read in original data
+new_train <- read_parquet("train_df.parquet")
+new_test <- read_parquet("test_df.parquet")
+
+print(paste("nrows in original train and test df:\n train:", nrow(new_train), "\ntest:", nrow(new_test)))
+
+# read in synthesized data
+all_ones_ctgan_200k <- read_parquet("ones_ctgan.parquet")
+all_ones_no_priv_ds_200k <- read_parquet("ones_ds0.parquet")
+all_ones_priv_ds_200k <- read_parquet("ones_ds1.parquet")
+
+ratio_ctgan_500k <- read_parquet("ctgan.parquet")
+ratio_no_priv_ds_500k <- read_parquet("ds0.parquet")
+ratio_priv_ds_500k <- read_parquet("ds1.parquet")
+
+cols_to_fix <- c( "label_document_1", 
+                  "label_document_2", 
+                  "label_document_3", 
+                  "label_document_4",
+                  "label_document_5", 
+                  "cillabel_document_1", 
+                  "cillabel_document_2", 
+                  "cillabel_document_3",
+                  "cillabel_document_4", 
+                  "cillabel_document_5")
+
+# Replace -1 with 0 in those columns for all sets
+new_train[cols_to_fix] <- lapply(new_train[cols_to_fix], function(x) ifelse(x == -1, 0, x))
+new_test[cols_to_fix] <- lapply(new_test[cols_to_fix], function(x) ifelse(x == -1, 0, x))
+all_ones_ctgan_200k[cols_to_fix] <- lapply(all_ones_ctgan_200k[cols_to_fix], 
+                                           function(x) ifelse(x == -1, 0, x))
+all_ones_no_priv_ds_200k[cols_to_fix] <- lapply(all_ones_no_priv_ds_200k[cols_to_fix], 
+                                                function(x) ifelse(x == -1, 0, x))
+all_ones_priv_ds_200k[cols_to_fix] <- lapply(all_ones_priv_ds_200k[cols_to_fix], 
+                                             function(x) ifelse(x == -1, 0, x))
+ratio_ctgan_500k[cols_to_fix] <- lapply(ratio_ctgan_500k[cols_to_fix], 
+                                        function(x) ifelse(x == -1, 0, x))
+ratio_no_priv_ds_500k[cols_to_fix] <- lapply(ratio_no_priv_ds_500k[cols_to_fix], 
+                                             function(x) ifelse(x == -1, 0, x))
+ratio_priv_ds_500k[cols_to_fix] <- lapply(ratio_priv_ds_500k[cols_to_fix], 
+                                          function(x) ifelse(x == -1, 0, x))
+
+# remove NaN values
+new_train <- na.omit(new_train)
+new_test <- na.omit(new_test)
+
+print(paste("nrows after removing NaNs train and test df :\n train:", nrow(new_train), "\ntest:", nrow(new_test)))
+```
+
+
+```{r}
+# double checking label distributions from original data and synthesized data
+prop.table(table(new_train$label))
+prop.table(table(ratio_ctgan_500k$label))
+prop.table(table(new_test$label))
+```
+
+```{r}
+# function for running the lightGBM model
+train_lgb_model <- function(train_data, 
+                            test_data, 
+                            used_cols, 
+                            label_col = "label", 
+                            categorical_cols = NULL, 
+                            threshold = 0.1, 
+                            nrounds = 500) 
+{
+  
+  keep_cols <- unique(c(used_cols, label_col))
+  train_data <- train_data[, intersect(names(train_data), keep_cols)]
+  test_data <- test_data[, intersect(names(test_data), keep_cols)]
+  
+  train_matrix <- lgb.Dataset(
+    data = data.matrix(train_data[, names(train_data) != label_col]),
+    label = train_data[[label_col]],
+    categorical_feature = categorical_cols
+  )
+  
+  params <- list(
+    objective = "binary",
+    metric = "auc"
+  )
+  
+  model <- lgb.train(params, train_matrix, nrounds)
+  preds <- predict(model, data.matrix(test_data[, names(test_data) != label_col]))
+  pred_class <- ifelse(preds >= threshold, 1, 0)
+  
+  # Confusion matrix
+  cm <- table(Predicted = pred_class, Actual = test_data[[label_col]])
+  cm_full <- confusionMatrix(factor(pred_class), factor(test_data[[label_col]]))
+  
+  return(list(
+    model = model,
+    predictions = preds,
+    predicted_classes = pred_class,
+    confusion_matrix = cm,
+    confusionMatrix_full = cm_full,
+    test_labels = test_data[[label_col]]
+  ))
+}
+```
+
+
+```{r}
+# columns to use when training
+used_cols <- c(
+  "creat_type_cd",
+  "slot_id",
+  "u_refreshTimes.x",
+  "city",
+  "u_feedLifeCycle.x",
+  "device_name",
+  "device_size",
+  "label",
+  "app_score",
+  "gender",
+  "city_rank",
+  "u_newsCatDislike",
+  "u_browserLifeCycle"
+  ,"u_browserMode",
+  "net_type",
+  "inter_type_cd",
+  "spread_app_id",
+  "residence",
+  "emui_dev",
+  "app_second_class",
+  "series_dev",
+  "net_type",
+  "site_id",
+  "hispace_app_tags",
+  "series_group",
+  "u_phonePrice",
+  "label_document_1",
+  "label_document_2",
+  "label_document_3",
+  "label_document_4",
+  "label_document_5",
+  "pro_document_1"
+)
+
+numerical_cols = c("device_size","label","app_score","city_rank")
+
+# define the categorical columns
+categorical_cols <- intersect(setdiff(names(new_train), numerical_cols), used_cols)
+categorical_cols
+```
+
+```{r}
+# check for NA values
+for (x in names(new_train[,categorical_cols]))
+{
+  if (any(is.na(new_train[,x])) == T)
+  {
+    print(paste(x, any(is.na(new_train[,x]))))
+    print(paste("Sum:", sum(is.na(new_train[,x]))))
+  }
+}
+```
+
+# Evaluation Metrics
+
+```{r}
+# Metrics for evaluating models
+
+# F1 Score
+f1_score <- function(conf_matrix, positive_class = 1) {
+  TP <- conf_matrix[as.character(positive_class), as.character(positive_class)]
+  FP <- sum(conf_matrix[as.character(positive_class), ])- TP
+  FN <- sum(conf_matrix[, as.character(positive_class)])- TP
+  precision <- TP / (TP + FP)
+  recall <- TP / (TP + FN)
+  f1 <- 2 * (precision * recall) / (precision + recall)
+  return(f1)
+}
+
+# Accuracy
+accuracy_score <- function(conf_matrix) {
+  correct <- sum(diag(conf_matrix))
+  total <- sum(conf_matrix)
+  accuracy <- correct / total
+  return(accuracy)
+}
+
+# Precision
+precision_score <- function(conf_matrix, positive_class = 1) {
+  TP <- conf_matrix[as.character(positive_class), as.character(positive_class)]
+  FP <- sum(conf_matrix[as.character(positive_class), ])- TP
+  precision <- TP / (TP + FP)
+  return(precision)
+}
+
+# Recall
+recall_score <- function(conf_matrix, positive_class = 1) {
+  TP <- conf_matrix[as.character(positive_class), as.character(positive_class)]
+  FN <- sum(conf_matrix[, as.character(positive_class)])- TP
+  recall <- TP / (TP + FN)
+  return(recall)
+}
+
+# AUC ROC
+auc_score <- function(model_results) {
+  true_labels <- model_results$test_labels
+  predicted_probs <- model_results$predictions
+  roc_obj <- roc(true_labels, predicted_probs)
+  return(as.numeric(auc(roc_obj)))
+}
+```
+
+
+
+# Base Model Training 
+
+```{r}
+# Training a base model to make sure everything is working
+base_results <- train_lgb_model(new_train, new_test, used_cols, label_col = "label", categorical_cols, threshold = 0.1, nrounds = 500)
+# Extract metrics
+cm <- base_results$confusionMatrix_full$byClass
+
+acc <- base_results$confusionMatrix_full$overall["Accuracy"]
+prec <- cm["Precision"]
+rec <- cm["Recall"]
+f1 <- cm["F1"]
+auc = auc_score(base_results)
+```
+
+
+```{r}
+# print base data results
+base_df_results = data.frame(
+      accuracy = acc,
+      precision = prec,
+      recall = rec,
+      f1 = f1,
+      auc = auc
+    )
+base_df_results
+
+# print base results confusion matrix
+print(base_results$confusion_matrix)
+```
+
+
+# Gradually Adding Synthetic Ones 
+
+## CTGAN
+
+```{r}
+# Making sure train, test and all_ones dataframe are the same type (was previously leading to errors)
+new_train$e_et_document_1 <- as.numeric(new_train$e_et_document_1)
+new_test$e_et_document_1  <- as.numeric(new_test$e_et_document_1)
+all_ones_ctgan_200k$e_et_document_1 <- as.numeric(all_ones_ctgan_200k$e_et_document_1)
+```
+
+
+```{r}
+## CTGAN
+# percentages to test for synthetic data
+percentages <- seq(from = 0, to = 1, by = 0.1)
+
+ctgan_results <- data.frame(
+  percent_added = numeric(),
+  accuracy = numeric(),
+  precision = numeric(),
+  recall = numeric(),
+  f1 = numeric(),
+  auc = numeric(),
+  stringsAsFactors = FALSE
+)
+
+for (p in percentages)
+{
+  
+  cat("\nRunning experiment for p =", p, "\n")
+  
+  n_real <- nrow(new_train)
+  n_to_add <- as.integer(p * n_real) # number of synthetic 1s to add
+  
+  # sample synthetic ones
+  synthetic_rows <- all_ones_ctgan_200k %>% slice_sample(n = n_to_add, replace = TRUE)
+  
+  # create the new dataset
+  augmented_train <- bind_rows(new_train, synthetic_rows)
+  
+  # train the model
+  model_out <- train_lgb_model(
+    train_data = augmented_train,
+    test_data = new_test,
+    used_cols = used_cols,
+    label_col = "label",
+    categorical_cols = categorical_cols,
+    threshold = 0.1,
+    nrounds = 500
+  )
+  
+  # Extract metrics
+  cm <- model_out$confusion_matrix
+  
+  acc <- accuracy_score(cm)
+  prec <- precision_score(cm)
+  rec <- recall_score(cm)
+  f1 <- f1_score(cm)
+  auc = auc_score(model_out)
+  
+  # store results in table
+  ctgan_results <- rbind(
+    ctgan_results,
+    data.frame(
+      percent_added = p * 100,
+      accuracy = acc,
+      precision = prec,
+      recall = rec,
+      f1 = f1,
+      auc = auc
+    )
+  )
+}
+
+# add in names
+ctgan_name_vec = rep("CTGAN", length.out = 11)
+ctgan_results = add_column(ctgan_results, new_col = ctgan_name_vec, .after = 0)
+ctgan_results = ctgan_results %>% rename(syn_data_type = new_col)
+
+
+# View results
+print(ctgan_results)
+```
+
+
+```{r}
+# Plot the f1 and AUC over different percetages
+ggplot(ctgan_results, aes(x = percent_added, y = f1)) +
+  geom_bar(stat = "identity", fill = "#CC3366") +
+  geom_text(aes(label = round(f1, 3)), 
+            vjust = -0.5, size = 4) +
+  labs(title = "CTGAN: F1 Score vs Synthetic 1s Added",
+       x = "Percent Synthetic 1s Added",
+       y = "F1 Score") +
+  theme_minimal()
+
+ggplot(ctgan_results, aes(x = percent_added, y = auc)) +
+  geom_bar(stat = "identity", fill = "#CC3366") +
+  geom_text(aes(label = round(f1, 3)), 
+            vjust = -0.5, size = 4) +
+  labs(title = "CTGAN: AUC Score vs Synthetic 1s Added",
+       x = "Percent Synthetic 1s Added",
+       y = "AUC Score") +
+  theme_minimal()
+```
+
+
+## DS no Privacy
+
+```{r}
+# Making sure train, test and all_ones dataframe are the same type (was previously leading to errors)
+for (col in names(new_train)) {
+  
+  # only align if synthetic has the same column
+  if (col %in% names(all_ones_no_priv_ds_200k)) {
+    
+    real_class <- class(new_train[[col]])
+    
+    if (real_class == "character") {
+      new_test[[col]] <- as.character(new_test[[col]])
+      all_ones_no_priv_ds_200k[[col]] <- as.character(all_ones_no_priv_ds_200k[[col]])
+      
+    } else if (real_class == "numeric") {
+      all_ones_no_priv_ds_200k[[col]] <- as.numeric(all_ones_no_priv_ds_200k[[col]])
+      
+    } else if (real_class == "integer") {
+      all_ones_no_priv_ds_200k[[col]] <- as.integer(all_ones_no_priv_ds_200k[[col]])
+      
+    } else if (real_class == "factor") {
+      all_ones_no_priv_ds_200k[[col]] <- as.factor(all_ones_no_priv_ds_200k[[col]])
+    }
+  }
+}
+
+mismatched <- sapply(names(new_train), function(col) {
+  col %in% names(all_ones_no_priv_ds_200k) &&
+    class(new_train[[col]]) != class(all_ones_no_priv_ds_200k[[col]])
+})
+names(mismatched)[mismatched]
+
+new_train$e_et_document_1 <- as.numeric(new_train$e_et_document_1)
+new_test$e_et_document_1  <- as.numeric(new_test$e_et_document_1)
+all_ones_no_priv_ds_200k$e_et_document_1 <- as.numeric(all_ones_no_priv_ds_200k$e_et_document_1)
+```
+
+
+```{r}
+# DS no Privacy
+# percentages to test for synthetic data
+percentages <- seq(from = 0, to = 1, by = 0.1)
+
+ds_no_priv_results <- data.frame(
+  percent_added = numeric(),
+  accuracy = numeric(),
+  precision = numeric(),
+  recall = numeric(),
+  f1 = numeric(),
+  auc = numeric(),
+  stringsAsFactors = FALSE
+)
+
+for (p in percentages) 
+{
+  
+  cat("\nRunning experiment for p =", p, "\n")
+  
+  n_real <- nrow(new_train)
+  n_to_add <- as.integer(p * n_real) # number of synthetic 1s to add
+  
+  # sample synthetic ones
+  synthetic_rows <- all_ones_no_priv_ds_200k %>% slice_sample(n = n_to_add, replace = TRUE)
+  
+  # create the new dataset
+  augmented_train <- bind_rows(new_train, synthetic_rows)
+  
+  # train the model
+  model_out <- train_lgb_model(
+    train_data = augmented_train,
+    test_data = new_test,
+    used_cols = used_cols,
+    label_col = "label",
+    categorical_cols = categorical_cols,
+    threshold = 0.1,
+    nrounds = 500
+  )
+  
+  # Extract metrics
+  cm <- model_out$confusion_matrix
+  
+  acc <- accuracy_score(cm)
+  prec <- precision_score(cm)
+  rec <- recall_score(cm)
+  f1 <- f1_score(cm)
+  auc = auc_score(model_out)
+  
+  # store results in table
+  ds_no_priv_results <- rbind(
+    ds_no_priv_results,
+    data.frame(
+      percent_added = p * 100,
+      accuracy = acc,
+      precision = prec,
+      recall = rec,
+      f1 = f1,
+      auc = auc
+    )
+  )
+}
+
+# add in names
+ds_no_priv_name_vec = rep("DS No Privacy", length.out = 11)
+ds_no_priv_results = add_column(ds_no_priv_results, new_col = ds_no_priv_name_vec, .after = 0)
+ds_no_priv_results = ds_no_priv_results %>% rename(syn_data_type = new_col)
+
+# View results
+print(ds_no_priv_results)
+```
+
+
+```{r}
+ggplot(ds_no_priv_results, aes(x = percent_added, y = f1)) +
+  geom_bar(stat = "identity", fill = "#000080") +
+  geom_text(aes(label = round(f1, 3)), 
+            vjust = -0.5, size = 4) +
+  labs(title = "DS No Privacy: F1 Score vs Synthetic 1s Added",
+       x = "Percent Synthetic 1s Added",
+       y = "F1 Score") +
+  theme_minimal()
+
+ggplot(ds_no_priv_results, aes(x = percent_added, y = auc)) +
+  geom_bar(stat = "identity", fill = "#000080") +
+  geom_text(aes(label = round(f1, 3)), 
+            vjust = -0.5, size = 4) +
+  labs(title = "DS No Privacy: AUC Score vs Synthetic 1s Added",
+       x = "Percent Synthetic 1s Added",
+       y = "AUC Score") +
+  theme_minimal()
+```
+
+
+
+
+## DS with Privacy
+
+```{r}
+# Making sure train, test and all_ones dataframe are the same type (was previously leading to errors)
+for (col in names(new_train)) {
+  
+  # only align if synthetic has the same column
+  if (col %in% names(all_ones_priv_ds_200k)) {
+    
+    real_class <- class(new_train[[col]])
+    
+    if (real_class == "character") {
+      new_test[[col]] <- as.character(new_test[[col]])
+      all_ones_priv_ds_200k[[col]] <- as.character(all_ones_priv_ds_200k[[col]])
+      
+    } else if (real_class == "numeric") {
+      all_ones_priv_ds_200k[[col]] <- as.numeric(all_ones_priv_ds_200k[[col]])
+      
+    } else if (real_class == "integer") {
+      all_ones_priv_ds_200k[[col]] <- as.integer(all_ones_priv_ds_200k[[col]])
+      
+    } else if (real_class == "factor") {
+      all_ones_priv_ds_200k[[col]] <- as.factor(all_ones_priv_ds_200k[[col]])
+    }
+  }
+}
+
+mismatched <- sapply(names(new_train), function(col) {
+  col %in% names(all_ones_priv_ds_200k) &&
+    class(new_train[[col]]) != class(all_ones_priv_ds_200k[[col]])
+})
+names(mismatched)[mismatched]
+
+new_train$e_et_document_1 <- as.numeric(new_train$e_et_document_1)
+new_test$e_et_document_1  <- as.numeric(new_test$e_et_document_1)
+all_ones_priv_ds_200k$e_et_document_1 <- as.numeric(all_ones_priv_ds_200k$e_et_document_1)
+
+mismatched <- sapply(names(new_train), function(col) {
+  col %in% names(all_ones_priv_ds_200k) &&
+    class(new_train[[col]]) != class(all_ones_priv_ds_200k[[col]])
+})
+names(mismatched)[mismatched]
+```
+
+
+```{r}
+# DS with Privacy
+# percentages to test for synthetic data
+percentages <- seq(from = 0, to = 1, by = 0.1)
+
+ds_priv_results <- data.frame(
+  percent_added = numeric(),
+  accuracy = numeric(),
+  precision = numeric(),
+  recall = numeric(),
+  f1 = numeric(),
+  auc = numeric(),
+  stringsAsFactors = FALSE
+)
+
+for (p in percentages) 
+{
+  
+  cat("\nRunning experiment for p =", p, "\n")
+  
+  n_real <- nrow(new_train)
+  n_to_add <- as.integer(p * n_real) # number of synthetic 1s to add
+  
+  # sample synthetic ones
+  synthetic_rows <- all_ones_priv_ds_200k %>% slice_sample(n = n_to_add, replace = TRUE)
+  
+  # create the new dataset
+  augmented_train <- bind_rows(new_train, synthetic_rows)
+  
+  # train the model
+  model_out <- train_lgb_model(
+    train_data = augmented_train,
+    test_data = new_test,
+    used_cols = used_cols,
+    label_col = "label",
+    categorical_cols = categorical_cols,
+    threshold = 0.1,
+    nrounds = 500
+  )
+  
+   # Extract metrics
+  cm <- model_out$confusion_matrix
+  
+  acc <- accuracy_score(cm)
+  prec <- precision_score(cm)
+  rec <- recall_score(cm)
+  f1 <- f1_score(cm)
+  auc = auc_score(model_out)
+  
+  # store results in table
+  ds_priv_results <- rbind(
+    ds_priv_results,
+    data.frame(
+      percent_added = p * 100,
+      accuracy = acc,
+      precision = prec,
+      recall = rec,
+      f1 = f1,
+      auc = auc
+    )
+  )
+}
+
+# add in names
+ds_priv_name_vec = rep("DS With Privacy", length.out = 11)
+ds_priv_results = add_column(ds_priv_results, new_col = ds_priv_name_vec, .after = 0)
+ds_priv_results = ds_priv_results %>% rename(syn_data_type = new_col)
+
+# View results
+print(ds_priv_results)
+```
+
+
+```{r}
+ggplot(ds_priv_results, aes(x = percent_added, y = f1)) +
+  geom_bar(stat = "identity", fill = "pink") +
+  labs(title = "DS with Privacy: F1 Score vs Synthetic 1s Added",
+       x = "Percent Synthetic 1s Added",
+       y = "F1 Score") +
+  theme_minimal()
+
+ggplot(ds_priv_results, aes(x = percent_added, y = auc)) +
+  geom_bar(stat = "identity", fill = "pink") +
+  labs(title = "DS with Privacy: AUC Score vs Synthetic 1s Added",
+       x = "Percent Synthetic 1s Added",
+       y = "AUC Score") +
+  theme_minimal()
+```
+
+
+## Combine Results into One Graph
+
+```{r}
+# combine tables into one table
+synthetic_ones_table = bind_rows(ctgan_results, ds_no_priv_results, ds_priv_results)
+synthetic_ones_table
+
+# create custom color scheme
+my_colors <- c(
+  "CTGAN" = "red",
+  "DS With Privacy" = "#CC3366",
+  "DS No Privacy" = "#000080"
+)
+
+# plot the data 
+
+# f1 score over percentages added for each synthetic data type
+p1 = ggplot(synthetic_ones_table, aes(x = percent_added, y = f1, color = syn_data_type)) +
+  geom_line() +
+  scale_color_manual(values = my_colors) +
+  labs(title = "F1 Score vs Synthetic 1s Added",
+       x = "Percent Synthetic 1s Added (%)",
+       y = "F1 Score",
+       color = "Synthetic Data Type") +
+  theme_minimal()
+
+ggsave("f1_score_plot_1s.png", p1, width = 8, height = 5, dpi = 300)
+
+# AUC score over percentages added for each synthetic data type
+p2 = ggplot(synthetic_ones_table, aes(x = percent_added, y = auc, color = syn_data_type)) +
+  geom_line() +
+  scale_color_manual(values = my_colors) +
+  labs(title = "AUC Score vs Synthetic 1s Added",
+       x = "Percent Synthetic 1s Added (%)",
+       y = "AUC Score",
+       color = "Synthetic Data Type") +
+  theme_minimal()
+
+ggsave("auc_score_plot_1s.png", p2, width = 8, height = 5, dpi = 300)
+```
+
+
+# Combining Real and Synthetic Data
+
+## CTGAN
+
+```{r}
+# Making sure train, test and all_ones dataframe are the same type (was previously leading to errors)
+new_train$e_et_document_1 <- as.numeric(new_train$e_et_document_1)
+new_test$e_et_document_1  <- as.numeric(new_test$e_et_document_1)
+ratio_ctgan_500k$e_et_document_1 <- as.numeric(ratio_ctgan_500k$e_et_document_1)
+```
+
+
+```{r}
+percentages <- seq(0, 1, by = 0.1)
+label_distribution <- rep(NA, times = length(percentages))
+
+ctgan_syn_mix_results <- data.frame(
+  percent_synthetic = numeric(),
+  accuracy = numeric(),
+  precision = numeric(),
+  recall = numeric(),
+  f1 = numeric(),
+  auc = numeric(),
+  stringsAsFactors = FALSE
+)
+
+n_total <- nrow(new_train)   # Keep dataset size constant
+
+for (p in percentages) 
+{
+  
+  cat("\nRunning experiment: ", p*100, "% synthetic\n")
+  
+  n_synth <- as.integer(p * n_total)
+  n_real  <- n_total - n_synth
+  
+  # sample real rows
+  real_subset <- new_train %>% slice_sample(n = n_real, replace = FALSE)
+  
+  # sample synthetic rows
+  synthetic_subset <- ratio_ctgan_500k %>% slice_sample(n = n_synth, replace = FALSE)
+  
+  # combine them
+  mixed_train <- bind_rows(real_subset, synthetic_subset)
+  
+  # train LightGBM
+  model_out <- train_lgb_model(
+    train_data = mixed_train,
+    test_data = new_test,
+    used_cols = used_cols,
+    label_col = "label",
+    categorical_cols = categorical_cols,
+    threshold = 0.1,
+    nrounds = 500
+  )
+  
+  # Extract metrics
+  cm <- model_out$confusion_matrix
+  
+  acc <- accuracy_score(cm)
+  prec <- precision_score(cm)
+  rec <- recall_score(cm)
+  f1 <- f1_score(cm)
+  auc = auc_score(model_out)
+  
+  ctgan_syn_mix_results <- rbind(
+    ctgan_syn_mix_results,
+    data.frame(
+      percent_synthetic = p * 100,
+      accuracy = acc,
+      precision = prec,
+      recall = rec,
+      f1 = f1,
+      auc = auc
+    )
+  )
+  
+  # Print out label distributions after every iteration
+  print(table(mixed_train$label))
+  print(prop.table(table(mixed_train$label)))
+}
+
+# add in names
+ctgan_name_vec = rep("CTGAN", length.out = 11)
+ctgan_syn_mix_results = add_column(ctgan_syn_mix_results, new_col = ctgan_name_vec, .after = 0)
+ctgan_syn_mix_results = ctgan_syn_mix_results %>% rename(syn_data_type = new_col)
+
+print(ctgan_syn_mix_results)
+```
+
+```{r}
+ggplot(ctgan_syn_mix_results, aes(x = percent_synthetic, y = f1)) +
+  geom_bar(stat = "identity", fill = "skyblue") +
+  labs(title = "CTGAN: F1 Score vs Ratio of Synthetic Data",
+       x = "Percentage Synthetic Data",
+       y = "F1 Score") +
+  theme_minimal()
+
+ggplot(ctgan_syn_mix_results, aes(x = percent_synthetic, y = auc)) +
+  geom_bar(stat = "identity", fill = "skyblue") +
+  labs(title = "CTGAN: AUC Score vs Ratio of Synthetic Data",
+       x = "Percentage Synthetic Data",
+       y = "AUC Score") +
+  theme_minimal()
+```
+
+
+
+
+## DS No Privacy
+
+```{r}
+# Making sure train, test and all_ones dataframe are the same type (was previously leading to errors)
+for (col in names(new_train)) {
+  
+  # only align if synthetic has the same column
+  if (col %in% names(ratio_no_priv_ds_500k)) {
+    
+    real_class <- class(new_train[[col]])
+    
+    if (real_class == "character") {
+      new_test[[col]] <- as.character(new_test[[col]])
+      ratio_no_priv_ds_500k[[col]] <- as.character(ratio_no_priv_ds_500k[[col]])
+      
+    } else if (real_class == "numeric") {
+      ratio_no_priv_ds_500k[[col]] <- as.numeric(ratio_no_priv_ds_500k[[col]])
+      
+    } else if (real_class == "integer") {
+      ratio_no_priv_ds_500k[[col]] <- as.integer(ratio_no_priv_ds_500k[[col]])
+      
+    } else if (real_class == "factor") {
+      ratio_no_priv_ds_500k[[col]] <- as.factor(ratio_no_priv_ds_500k[[col]])
+    }
+  }
+}
+
+mismatched <- sapply(names(new_train), function(col) {
+  col %in% names(ratio_no_priv_ds_500k) &&
+    class(new_train[[col]]) != class(ratio_no_priv_ds_500k[[col]])
+})
+names(mismatched)[mismatched]
+
+new_train$e_et_document_1 <- as.numeric(new_train$e_et_document_1)
+new_test$e_et_document_1  <- as.numeric(new_test$e_et_document_1)
+ratio_no_priv_ds_500k$e_et_document_1 <- as.numeric(ratio_no_priv_ds_500k$e_et_document_1)
+```
+
+
+```{r}
+percentages <- seq(0, 1, by = 0.1)
+label_distribution <- rep(NA, times = length(percentages))
+
+ds_no_priv_syn_mix_results <- data.frame(
+  percent_synthetic = numeric(),
+  accuracy = numeric(),
+  precision = numeric(),
+  recall = numeric(),
+  f1 = numeric(),
+  auc = numeric(),
+  stringsAsFactors = FALSE
+)
+
+n_total <- nrow(new_train)   # Keep dataset size constant
+
+for (p in percentages) 
+{
+  
+  cat("\nRunning experiment: ", p*100, "% synthetic\n")
+  
+  n_synth <- as.integer(p * n_total)
+  n_real  <- n_total - n_synth
+  
+  # sample real rows
+  real_subset <- new_train %>% slice_sample(n = n_real, replace = FALSE)
+  
+  # sample synthetic rows
+  synthetic_subset <- ratio_no_priv_ds_500k %>% slice_sample(n = n_synth, replace = FALSE)
+  
+  # combine them
+  mixed_train <- bind_rows(real_subset, synthetic_subset)
+  
+  # train LightGBM
+  model_out <- train_lgb_model(
+    train_data = mixed_train,
+    test_data = new_test,
+    used_cols = used_cols,
+    label_col = "label",
+    categorical_cols = categorical_cols,
+    threshold = 0.1,
+    nrounds = 500
+  )
+  
+  # Extract metrics
+  cm <- model_out$confusion_matrix
+  
+  acc <- accuracy_score(cm)
+  prec <- precision_score(cm)
+  rec <- recall_score(cm)
+  f1 <- f1_score(cm)
+  auc = auc_score(model_out)
+  
+  ds_no_priv_syn_mix_results <- rbind(
+    ds_no_priv_syn_mix_results,
+    data.frame(
+      percent_synthetic = p * 100,
+      accuracy = acc,
+      precision = prec,
+      recall = rec,
+      f1 = f1,
+      auc = auc
+    )
+  )
+  
+  # Print out label distributions after every iteration
+  print(table(mixed_train$label))
+  print(prop.table(table(mixed_train$label)))
+}
+
+# add in names
+ds_no_priv_name_vec = rep("DS No Privacy", length.out = 11)
+ds_no_priv_syn_mix_results = add_column(ds_no_priv_syn_mix_results, new_col = ds_no_priv_name_vec, .after = 0)
+ds_no_priv_syn_mix_results = ds_no_priv_syn_mix_results %>% rename(syn_data_type = new_col)
+
+print(ds_no_priv_syn_mix_results)
+```
+
+```{r}
+ggplot(ds_no_priv_syn_mix_results, aes(x = percent_synthetic, y = f1)) +
+  geom_bar(stat = "identity", fill = "mediumpurple") +
+  labs(title = "DS No Privacy: F1 Score vs Ratio of Synthetic Data",
+       x = "Percentage Synthetic Data",
+       y = "F1 Score") +
+  theme_minimal()
+
+ggplot(ds_no_priv_syn_mix_results, aes(x = percent_synthetic, y = auc)) +
+  geom_bar(stat = "identity", fill = "mediumpurple") +
+  labs(title = "DS No Privacy: AUC Score vs Ratio of Synthetic Data",
+       x = "Percentage Synthetic Data",
+       y = "AUC Score") +
+  theme_minimal()
+```
+
+
+
+
+
+## DS with Privacy
+
+```{r}
+# Making sure train, test and all_ones dataframe are the same type (was previously leading to errors)
+for (col in names(new_train)) {
+  
+  # only align if synthetic has the same column
+  if (col %in% names(ratio_priv_ds_500k)) {
+    
+    real_class <- class(new_train[[col]])
+    
+    if (real_class == "character") {
+      new_test[[col]] <- as.character(new_test[[col]])
+      ratio_priv_ds_500k[[col]] <- as.character(ratio_priv_ds_500k[[col]])
+      
+    } else if (real_class == "numeric") {
+      ratio_priv_ds_500k[[col]] <- as.numeric(ratio_priv_ds_500k[[col]])
+      
+    } else if (real_class == "integer") {
+      ratio_priv_ds_500k[[col]] <- as.integer(ratio_priv_ds_500k[[col]])
+      
+    } else if (real_class == "factor") {
+      ratio_priv_ds_500k[[col]] <- as.factor(ratio_priv_ds_500k[[col]])
+    }
+  }
+}
+
+mismatched <- sapply(names(new_train), function(col) {
+  col %in% names(ratio_priv_ds_500k) &&
+    class(new_train[[col]]) != class(ratio_priv_ds_500k[[col]])
+})
+names(mismatched)[mismatched]
+
+new_train$e_et_document_1 <- as.numeric(new_train$e_et_document_1)
+new_test$e_et_document_1  <- as.numeric(new_test$e_et_document_1)
+ratio_priv_ds_500k$e_et_document_1 <- as.numeric(ratio_priv_ds_500k$e_et_document_1)
+```
+
+
+```{r}
+percentages <- seq(0, 1, by = 0.1)
+label_distribution <- rep(NA, times = length(percentages))
+
+ds_priv_syn_mix_results <- data.frame(
+  percent_synthetic = numeric(),
+  accuracy = numeric(),
+  precision = numeric(),
+  recall = numeric(),
+  f1 = numeric(),
+  auc = numeric(),
+  stringsAsFactors = FALSE
+)
+
+n_total <- nrow(new_train)   # Keep dataset size constant
+
+for (p in percentages) 
+{
+  
+  cat("\nRunning experiment: ", p*100, "% synthetic\n")
+  
+  n_synth <- as.integer(p * n_total)
+  n_real  <- n_total - n_synth
+  
+  # sample real rows
+  real_subset <- new_train %>% slice_sample(n = n_real, replace = FALSE)
+  
+  # sample synthetic rows
+  synthetic_subset <- ratio_priv_ds_500k %>% slice_sample(n = n_synth, replace = FALSE)
+  
+  # combine them
+  mixed_train <- bind_rows(real_subset, synthetic_subset)
+  
+  # train LightGBM
+  model_out <- train_lgb_model(
+    train_data = mixed_train,
+    test_data = new_test,
+    used_cols = used_cols,
+    label_col = "label",
+    categorical_cols = categorical_cols,
+    threshold = 0.1,
+    nrounds = 500
+  )
+  
+  # Extract metrics
+  cm <- model_out$confusion_matrix
+  
+  acc <- accuracy_score(cm)
+  prec <- precision_score(cm)
+  rec <- recall_score(cm)
+  f1 <- f1_score(cm)
+  auc = auc_score(model_out)
+  
+  ds_priv_syn_mix_results <- rbind(
+    ds_priv_syn_mix_results,
+    data.frame(
+      percent_synthetic = p * 100,
+      accuracy = acc,
+      precision = prec,
+      recall = rec,
+      f1 = f1,
+      auc = auc
+    )
+  )
+  
+  # Print out label distributions after every iteration
+  print(table(mixed_train$label))
+  print(prop.table(table(mixed_train$label)))
+}
+
+# add in names
+ds_priv_name_vec = rep("DS With Privacy", length.out = 11)
+ds_priv_syn_mix_results = add_column(ds_priv_syn_mix_results, new_col = ds_priv_name_vec, .after = 0)
+ds_priv_syn_mix_results = ds_priv_syn_mix_results %>% rename(syn_data_type = new_col)
+
+print(ds_priv_syn_mix_results)
+```
+
+
+```{r}
+ggplot(ds_priv_syn_mix_results, aes(x = percent_synthetic, y = f1)) +
+  geom_bar(stat = "identity", fill = "pink") +
+  labs(title = "DS With Privacy: F1 Score vs Ratio of Synthetic Data",
+       x = "Percentage Synthetic Data",
+       y = "F1 Score") +
+  theme_minimal()
+
+ggplot(ds_priv_syn_mix_results, aes(x = percent_synthetic, y = auc)) +
+  geom_bar(stat = "identity", fill = "pink") +
+  labs(title = "DS With Privacy: AUC Score vs Ratio of Synthetic Data",
+       x = "Percentage Synthetic Data",
+       y = "AUC Score") +
+  theme_minimal()
+```
+
+## Combine Results into One Graph
+
+```{r}
+# combine tables into one table
+synthetic_data_table = bind_rows(ctgan_syn_mix_results, 
+                                 ds_no_priv_syn_mix_results, 
+                                 ds_priv_syn_mix_results)
+synthetic_data_table
+
+# create custom color scheme
+my_colors <- c(
+  "CTGAN" = "red",
+  "DS With Privacy" = "#CC3366",
+  "DS No Privacy" = "#000080"
+)
+
+# plot the data 
+
+# f1 score over percentages added for each synthetic data type
+p3 = ggplot(synthetic_data_table, aes(x = percent_synthetic, y = f1, color = syn_data_type)) +
+  geom_line() +
+  scale_color_manual(values = my_colors) +
+  labs(title = "F1 Score vs Percentage of Synthetic Data",
+       x = "Percentage of Synthetic Data (%)",
+       y = "F1 Score",
+       color = "Synthetic Data Type") +
+  theme_minimal()
+
+ggsave("f1_score_plot_synthetic_ratios.png", p3, width = 8, height = 5, dpi = 300)
+
+# AUC score over percentages added for each synthetic data type
+p4 = ggplot(synthetic_data_table, aes(x = percent_synthetic, y = auc, color = syn_data_type)) +
+  geom_line() +
+  scale_color_manual(values = my_colors) +
+  labs(title = "AUC Score vs Percentage of Synthetic Data",
+       x = "Percentage of Synthetic Data (%)",
+       y = "AUC Score",
+       color = "Synthetic Data Type") +
+  theme_minimal()
+
+ggsave("auc_score_plot_synthetic_ratios.png", p4, width = 8, height = 5, dpi = 300)
+```
+
+
+
+
+
+
+
+
+
+
